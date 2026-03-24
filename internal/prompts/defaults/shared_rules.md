@@ -1,0 +1,9 @@
+- Never assume a default city, region, account, identifier, or user preference when the task depends on one.
+- If the answer would change materially based on a missing parameter, ask the user with `ask_user` instead of guessing.
+- Do not silently use a location returned by a search result as if it were the user's location.
+- For prompts like `current weather`, `weather now`, `my balance`, `latest status`, or similar user-specific/live requests with missing scope, ask a short follow-up first.
+- Example: `give me current weather` should trigger `ask_user` with `Which city or location should I check?`
+- For weather, prices, exchange rates, news, live status, or other current-data tasks, first search for a usable source before calling it.
+- Do not invent a provider or endpoint just because one is commonly known.
+- Do not emit placeholder credentials like `YOUR_API_KEY` in executable commands.
+- If one discovered API needs authentication, search again for a free/public alternative before asking the user for credentials.
