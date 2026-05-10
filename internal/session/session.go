@@ -92,6 +92,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			content TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -99,6 +103,26 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// GetSetting retrieves a value from the global settings table.
+// Returns ("", false) if the key does not exist.
+func (s *Store) GetSetting(key string) (string, bool) {
+	var value string
+	err := s.db.QueryRowContext(context.Background(), `SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+// SetSetting upserts a key/value pair in the global settings table.
+func (s *Store) SetSetting(key, value string) error {
+	_, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO settings(key, value) VALUES(?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		key, value)
+	return err
 }
 
 func NewID() string {
@@ -240,6 +264,12 @@ func (s *Session) AppendMessage(role, content string) error {
 
 func (s *Session) BriefMemory() (string, error) { return s.Memory.Brief() }
 
+// GetSetting retrieves a global setting from the backing store.
+func (s *Session) GetSetting(key string) (string, bool) { return s.store.GetSetting(key) }
+
+// SetSetting upserts a global setting in the backing store.
+func (s *Session) SetSetting(key, value string) error { return s.store.SetSetting(key, value) }
+
 func (s *Session) ClearMemory() error {
 	if s.Memory == nil {
 		return nil
@@ -267,6 +297,27 @@ func mergeConfig(stored, current config.Config) config.Config {
 	}
 	if current.OpenAIModel != "" {
 		stored.OpenAIModel = current.OpenAIModel
+	}
+	if current.Provider != "" {
+		stored.Provider = current.Provider
+	}
+	if current.OllamaBaseURL != "" {
+		stored.OllamaBaseURL = current.OllamaBaseURL
+	}
+	if current.OllamaModel != "" {
+		stored.OllamaModel = current.OllamaModel
+	}
+	if current.RouterModel != "" {
+		stored.RouterModel = current.RouterModel
+	}
+	if current.AgentModel != "" {
+		stored.AgentModel = current.AgentModel
+	}
+	if current.MemoryModel != "" {
+		stored.MemoryModel = current.MemoryModel
+	}
+	if current.SkillTimeoutSecs != 0 {
+		stored.SkillTimeoutSecs = current.SkillTimeoutSecs
 	}
 	if current.ExaAPIKey != "" {
 		stored.ExaAPIKey = current.ExaAPIKey

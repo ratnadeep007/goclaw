@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"ratnadeep007/goclaw/internal/config"
 )
 
 type Client struct {
@@ -69,6 +71,15 @@ func New(baseURL, apiKey, model string) *Client {
 		model = "gpt-4o-mini"
 	}
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), APIKey: apiKey, Model: model, HTTP: &http.Client{Timeout: 120 * time.Second}}
+}
+
+// NewClientForRole returns an LLM client configured for the given role ("router", "agent",
+// "memory"). It respects per-role model overrides and the active provider in cfg.
+func NewClientForRole(role string, cfg config.Config) *Client {
+	model := cfg.ActiveModel(role)
+	baseURL := cfg.ActiveBaseURL()
+	apiKey := cfg.ActiveAPIKey()
+	return New(baseURL, apiKey, model)
 }
 
 func (c *Client) Chat(ctx context.Context, messages []Message, tools []Tool) (Message, error) {

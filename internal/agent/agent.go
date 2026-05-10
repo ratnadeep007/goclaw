@@ -15,17 +15,21 @@ import (
 	"ratnadeep007/goclaw/internal/runtime"
 	"ratnadeep007/goclaw/internal/sandbox"
 	"ratnadeep007/goclaw/internal/search"
+	"ratnadeep007/goclaw/internal/skills"
 )
 
 type Agent struct {
-	Cfg      config.Config
-	Client   *llm.Client
-	Search   *search.Client
-	Memory   *memory.Store
-	Prompts  *prompts.Manager
-	AskUser  func(question string) (string, error)
-	Sandbox  *sandbox.Sandbox
-	MaxTurns int
+	Cfg          config.Config
+	Client       *llm.Client // main agent client (role: "agent")
+	RouterClient *llm.Client // routing decisions (role: "router")
+	MemoryClient *llm.Client // memory review (role: "memory")
+	Search       *search.Client
+	Memory       *memory.Store
+	Prompts      *prompts.Manager
+	AskUser      func(question string) (string, error)
+	Sandbox      *sandbox.Sandbox
+	MaxTurns     int
+	Skills       []skills.Skill
 }
 
 type ToolResult struct {
@@ -42,14 +46,21 @@ type routeDecision struct {
 
 func New(cfg config.Config, mem *memory.Store, sb *sandbox.Sandbox) *Agent {
 	return &Agent{
-		Cfg:      cfg,
-		Client:   llm.New(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIModel),
-		Search:   search.New(cfg.ExaBaseURL, cfg.ExaAPIKey),
-		Memory:   mem,
-		Prompts:  prompts.New(cfg.PromptDir),
-		AskUser:  nil,
-		Sandbox:  sb,
-		MaxTurns: cfg.MaxTurns,
+		Cfg:          cfg,
+		Client:       llm.NewClientForRole("agent", cfg),
+		RouterClient: llm.NewClientForRole("router", cfg),
+		MemoryClient: llm.NewClientForRole("memory", cfg),
+		Search:       search.New(cfg.ExaBaseURL, cfg.ExaAPIKey),
+		Memory:       mem,
+		Prompts:      prompts.New(cfg.PromptDir),
+		AskUser:      nil,
+		Sandbox:      sb,
+		MaxTurns:     cfg.MaxTurns,
+		Skills: []skills.Skill{
+			skills.NewClaude(cfg.SkillTimeoutSecs),
+			skills.NewCursor(cfg.SkillTimeoutSecs),
+			skills.NewOpenCode(cfg.SkillTimeoutSecs),
+		},
 	}
 }
 
@@ -80,7 +91,7 @@ func (a *Agent) Run(ctx context.Context, task string, history []llm.Message, syn
 	messages = append(messages, llm.Message{Role: "system", Content: system})
 	messages = append(messages, history...)
 	messages = append(messages, llm.Message{Role: "user", Content: task})
-	tools := agentTools()
+	tools := a.buildTools()
 	var results []ToolResult
 	var lastAssistant string
 	for turn := 0; turn < a.MaxTurns; turn++ {
@@ -123,7 +134,7 @@ func (a *Agent) route(ctx context.Context, task string, history []llm.Message, m
 	if err != nil {
 		return routeDecision{}, err
 	}
-	msg, err := a.Client.Chat(ctx, []llm.Message{{Role: "system", Content: prompt}}, nil)
+	msg, err := a.RouterClient.Chat(ctx, []llm.Message{{Role: "system", Content: prompt}}, nil)
 	if err != nil {
 		return routeDecision{}, err
 	}
@@ -142,7 +153,29 @@ func (a *Agent) route(ctx context.Context, task string, history []llm.Message, m
 }
 
 func (a *Agent) runTool(ctx context.Context, name, argsJSON string) (string, error) {
+	// Check skill tools first.
+	for _, sk := range a.Skills {
+		if sk.Name() == name {
+			var args map[string]any
+			if argsJSON != "" {
+				if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+					return "", fmt.Errorf("parse args for %s: %w", name, err)
+				}
+			}
+			return sk.Run(ctx, args)
+		}
+	}
+
 	switch name {
+	case "list_ollama_models":
+		models, err := llm.ListModels(ctx, a.Cfg.OllamaBaseURL)
+		if err != nil {
+			return "", fmt.Errorf("list_ollama_models: %w", err)
+		}
+		if len(models) == 0 {
+			return "No local Ollama models found.", nil
+		}
+		return "Available Ollama models:\n" + strings.Join(models, "\n"), nil
 	case "shell_exec":
 		var args struct {
 			Command string `json:"command"`
@@ -215,6 +248,32 @@ func (a *Agent) runTool(ctx context.Context, name, argsJSON string) (string, err
 	}
 }
 
+// buildTools assembles the full tool list: built-in tools + skill definitions.
+// list_ollama_models is only added when the active provider is ollama.
+func (a *Agent) buildTools() []llm.Tool {
+	tools := []llm.Tool{
+		functionTool("shell_exec", "Run a sandbox command", map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}, "required": []string{"command"}}),
+		functionTool("read_file", "Read a sandbox file", map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}, "required": []string{"path"}}),
+		functionTool("write_file", "Write a sandbox file", map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}}, "required": []string{"path", "content"}}),
+		functionTool("dump_sandbox", "Dump sandbox to host path", map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}, "required": []string{"path"}}),
+		functionTool("spawn_subagent", "Spawn a subagent", map[string]any{"type": "object", "properties": map[string]any{"task": map[string]any{"type": "string"}, "import_dir": map[string]any{"type": "string"}}, "required": []string{"task"}}),
+		functionTool("web_search", "Search the web for current or external information", map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}, "required": []string{"query"}}),
+		functionTool("ask_user", "Ask the user a follow-up question and wait for their answer", map[string]any{"type": "object", "properties": map[string]any{"question": map[string]any{"type": "string"}}, "required": []string{"question"}}),
+	}
+
+	// Add Ollama model listing only when using the Ollama provider.
+	if strings.ToLower(a.Cfg.Provider) == "ollama" {
+		tools = append(tools, functionTool("list_ollama_models", "List all locally available Ollama models", map[string]any{"type": "object", "properties": map[string]any{}}))
+	}
+
+	// Add skill tools.
+	for _, sk := range a.Skills {
+		tools = append(tools, sk.Definition())
+	}
+
+	return tools
+}
+
 func (a *Agent) spawnSubAgent(ctx context.Context, task, importDir string) (string, error) {
 	sb, err := sandbox.New(sandbox.Options{GoshellBin: a.Cfg.GoshellBin, Prompt: a.Cfg.SandboxPrompt, ImportPath: importDir})
 	if err != nil {
@@ -248,7 +307,7 @@ func (a *Agent) reviewAndUpdateMemory(task, final string, results []ToolResult, 
 }
 
 func (a *Agent) memoryReview(ctx context.Context, task, final string, results []ToolResult) (string, bool) {
-	if a.Client == nil {
+	if a.MemoryClient == nil {
 		return "", false
 	}
 	var toolNotes []string
@@ -263,7 +322,7 @@ func (a *Agent) memoryReview(ctx context.Context, task, final string, results []
 	if err != nil {
 		return "", false
 	}
-	msg, err := a.Client.Chat(ctx, []llm.Message{{Role: "system", Content: prompt}}, nil)
+	msg, err := a.MemoryClient.Chat(ctx, []llm.Message{{Role: "system", Content: prompt}}, nil)
 	if err != nil {
 		return "", false
 	}
@@ -275,18 +334,6 @@ func (a *Agent) memoryReview(ctx context.Context, task, final string, results []
 		return "", false
 	}
 	return strings.TrimSpace(parsed.Note), parsed.Save
-}
-
-func agentTools() []llm.Tool {
-	return []llm.Tool{
-		functionTool("shell_exec", "Run a sandbox command", map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}, "required": []string{"command"}}),
-		functionTool("read_file", "Read a sandbox file", map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}, "required": []string{"path"}}),
-		functionTool("write_file", "Write a sandbox file", map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}}, "required": []string{"path", "content"}}),
-		functionTool("dump_sandbox", "Dump sandbox to host path", map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}, "required": []string{"path"}}),
-		functionTool("spawn_subagent", "Spawn a subagent", map[string]any{"type": "object", "properties": map[string]any{"task": map[string]any{"type": "string"}, "import_dir": map[string]any{"type": "string"}}, "required": []string{"task"}}),
-		functionTool("web_search", "Search the web for current or external information", map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}, "required": []string{"query"}}),
-		functionTool("ask_user", "Ask the user a follow-up question and wait for their answer", map[string]any{"type": "object", "properties": map[string]any{"question": map[string]any{"type": "string"}}, "required": []string{"question"}}),
-	}
 }
 
 func functionTool(name, desc string, params map[string]any) llm.Tool {

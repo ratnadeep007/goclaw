@@ -1,8 +1,11 @@
 package tui
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -17,6 +20,7 @@ import (
 	"ratnadeep007/goclaw/internal/memory"
 	"ratnadeep007/goclaw/internal/runtime"
 	"ratnadeep007/goclaw/internal/session"
+	"ratnadeep007/goclaw/internal/skills"
 )
 
 var (
@@ -60,6 +64,13 @@ var slashCommands = []slashCommand{
 	{Command: "memory", Sub: "clear", Desc: "clear this session memory"},
 	{Command: "agents", Sub: "list", Desc: "list subagents"},
 	{Command: "sandbox", Sub: "list", Desc: "list goshell environments"},
+	{Command: "provider", Desc: "show active provider and model"},
+	{Command: "provider", Sub: "openai", Desc: "switch to OpenAI provider"},
+	{Command: "provider", Sub: "ollama", Desc: "switch to Ollama provider"},
+	{Command: "ollama", Sub: "models", Desc: "list available Ollama models"},
+	{Command: "ollama", Sub: "models <name>", Desc: "switch active Ollama model"},
+	{Command: "claude", Desc: "delegate a task to the Claude CLI (<task>)"},
+	{Command: "opencode", Desc: "delegate a task to the OpenCode CLI (<task>)"},
 }
 
 type runDoneMsg struct {
@@ -93,6 +104,25 @@ type model struct {
 
 func New(sess *session.Session) tea.Model {
 	cfg := sess.Config
+
+	// Apply any provider overrides stored in settings, but only when the
+	// corresponding env var was NOT explicitly set (env vars always win).
+	if os.Getenv("LLM_PROVIDER") == "" {
+		if p, ok := sess.GetSetting("provider"); ok {
+			cfg.Provider = p
+		}
+	}
+	if os.Getenv("OLLAMA_MODEL") == "" {
+		if m, ok := sess.GetSetting("ollama_model"); ok {
+			cfg.OllamaModel = m
+		}
+	}
+	if os.Getenv("OPENAI_MODEL") == "" {
+		if m, ok := sess.GetSetting("openai_model"); ok {
+			cfg.OpenAIModel = m
+		}
+	}
+
 	mem := sess.Memory
 	input := textinput.New()
 	input.Placeholder = "Ask goclaw to do something..."
@@ -194,7 +224,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.running = true
 			m.waiting = false
 			m.rebuild()
-			cmds = append(cmds, m.spin.Tick, startTask(m.agentCh, m.sess, task, history))
+			cmds = append(cmds, m.spin.Tick, startTask(m.agentCh, m.sess, m.cfg, task, history))
 		}
 	}
 
@@ -227,7 +257,9 @@ func (m model) View() string {
 	if m.waiting {
 		status = "waiting for input"
 	}
-	header := headerStyle.Render(fmt.Sprintf("%s | %s | model: %s | session: %s", title, status, m.cfg.OpenAIModel, m.sess.ID))
+	activeModel := m.cfg.ActiveModel("agent")
+	header := headerStyle.Render(fmt.Sprintf("%s | %s | provider: %s | model: %s | session: %s",
+		title, status, m.cfg.Provider, activeModel, m.sess.ID))
 	content := borderStyle.Width(m.vp.Width).Render(m.vp.View())
 	input := inputStyle.Width(m.input.Width + 2).Render(m.input.View())
 	out := header + "\n" + content + "\n" + input
@@ -245,9 +277,11 @@ func (m model) handleSlash(cmd string) (tea.Model, tea.Cmd) {
 		parts = []string{"/memory", "clear"}
 	}
 	m.input.SetValue("")
+
 	switch name {
 	case "exit", "quit":
 		return m, tea.Quit
+
 	case "memory":
 		sub := "brief"
 		if len(parts) > 1 {
@@ -271,6 +305,7 @@ func (m model) handleSlash(cmd string) (tea.Model, tea.Cmd) {
 		default:
 			m.messages = append(m.messages, errorStyle.Render("Unknown memory sub-command: "+sub))
 		}
+
 	case "agents":
 		sub := "list"
 		if len(parts) > 1 {
@@ -290,6 +325,7 @@ func (m model) handleSlash(cmd string) (tea.Model, tea.Cmd) {
 			lines = append(lines, fmt.Sprintf("%s [%s] sandbox=%s task=%s", it.ID, it.Status, it.SandboxID, strings.TrimSpace(it.Task)))
 		}
 		m.messages = append(m.messages, renderAssistantMessage("Agents:\n"+strings.Join(lines, "\n"), m.vp.Width))
+
 	case "sandbox", "sandboxes":
 		sub := "list"
 		if len(parts) > 1 {
@@ -309,9 +345,100 @@ func (m model) handleSlash(cmd string) (tea.Model, tea.Cmd) {
 			lines = append(lines, fmt.Sprintf("%s [%s] kind=%s label=%s", it.ID, it.Status, it.Kind, strings.TrimSpace(it.Label)))
 		}
 		m.messages = append(m.messages, renderAssistantMessage("Sandboxes:\n"+strings.Join(lines, "\n"), m.vp.Width))
+
+	case "provider":
+		if len(parts) == 1 {
+			info := fmt.Sprintf("**Provider:** %s\n**Model (agent):** %s\n**Model (router):** %s\n**Model (memory):** %s",
+				m.cfg.Provider,
+				m.cfg.ActiveModel("agent"),
+				m.cfg.ActiveModel("router"),
+				m.cfg.ActiveModel("memory"),
+			)
+			m.messages = append(m.messages, renderAssistantMessage(info, m.vp.Width))
+			break
+		}
+		sub := strings.ToLower(parts[1])
+		switch sub {
+		case "openai", "ollama":
+			m.cfg.Provider = sub
+			m.sess.Config.Provider = sub
+			_ = m.sess.SyncConfig()
+			_ = m.sess.SetSetting("provider", sub)
+			m.messages = append(m.messages, renderAssistantMessage(
+				fmt.Sprintf("Switched provider to **%s** (agent model: %s)", sub, m.cfg.ActiveModel("agent")),
+				m.vp.Width,
+			))
+		default:
+			m.messages = append(m.messages, errorStyle.Render(
+				fmt.Sprintf("Unknown provider: %s — supported: openai, ollama", sub),
+			))
+		}
+
+	case "ollama":
+		if len(parts) < 2 || strings.ToLower(parts[1]) != "models" {
+			m.messages = append(m.messages, errorStyle.Render("Usage: /ollama models [<model-name>]"))
+			break
+		}
+		if len(parts) == 2 {
+			// List available models.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			models, err := llm.ListModels(ctx, m.cfg.OllamaBaseURL)
+			if err != nil {
+				m.messages = append(m.messages, errorStyle.Render("Ollama models: "+err.Error()))
+				break
+			}
+			if len(models) == 0 {
+				m.messages = append(m.messages, renderAssistantMessage("No local Ollama models found. Try `ollama pull llama3` first.", m.vp.Width))
+				break
+			}
+			m.messages = append(m.messages, renderAssistantMessage("**Ollama models:**\n- "+strings.Join(models, "\n- "), m.vp.Width))
+		} else {
+			// Switch active Ollama model.
+			newModel := parts[2]
+			m.cfg.OllamaModel = newModel
+			m.sess.Config.OllamaModel = newModel
+			_ = m.sess.SyncConfig()
+			_ = m.sess.SetSetting("ollama_model", newModel)
+			m.messages = append(m.messages, renderAssistantMessage(
+				fmt.Sprintf("Ollama model switched to **%s**", newModel), m.vp.Width,
+			))
+		}
+
+	case "claude":
+		task := strings.TrimSpace(strings.TrimPrefix(cmd, "/claude"))
+		if task == "" {
+			m.messages = append(m.messages, errorStyle.Render("Usage: /claude <task>"))
+			break
+		}
+		sk := skills.NewClaude(m.cfg.SkillTimeoutSecs)
+		if !sk.Available() {
+			m.messages = append(m.messages, errorStyle.Render("claude binary not found on PATH — install the Claude CLI from https://claude.ai/cli"))
+			break
+		}
+		m.running = true
+		m.rebuild()
+		return m, skillTask(m.agentCh, sk, task, m.cfg.SkillTimeoutSecs)
+
+	case "opencode":
+		task := strings.TrimSpace(strings.TrimPrefix(cmd, "/opencode"))
+		if task == "" {
+			m.messages = append(m.messages, errorStyle.Render("Usage: /opencode <task>"))
+			break
+		}
+		sk := skills.NewOpenCode(m.cfg.SkillTimeoutSecs)
+		if !sk.Available() {
+			m.messages = append(m.messages, errorStyle.Render("opencode binary not found on PATH — install opencode (https://opencode.ai)"))
+			break
+		}
+		m.running = true
+		m.rebuild()
+		return m, skillTask(m.agentCh, sk, task, m.cfg.SkillTimeoutSecs)
+
 	default:
 		m.messages = append(m.messages, errorStyle.Render("Unknown command: "+cmd))
 	}
+
 	m.rebuild()
 	m.refreshHints()
 	return m, nil
@@ -326,13 +453,13 @@ func (m *model) refreshHints() {
 	query := strings.ToLower(strings.TrimPrefix(value, "/"))
 	var matched []string
 	var rest []string
-	for _, cmd := range slashCommands {
-		name := "/" + cmd.Command
-		if cmd.Sub != "" {
-			name += " " + cmd.Sub
+	for _, c := range slashCommands {
+		n := "/" + c.Command
+		if c.Sub != "" {
+			n += " " + c.Sub
 		}
-		line := fmt.Sprintf("%s — %s", name, cmd.Desc)
-		if query == "" || strings.Contains(strings.ToLower(strings.TrimPrefix(name, "/")), query) || strings.Contains(strings.ToLower(cmd.Desc), query) {
+		line := fmt.Sprintf("%s — %s", n, c.Desc)
+		if query == "" || strings.Contains(strings.ToLower(strings.TrimPrefix(n, "/")), query) || strings.Contains(strings.ToLower(c.Desc), query) {
 			matched = append(matched, line)
 		} else {
 			rest = append(rest, line)
@@ -352,7 +479,9 @@ func (m model) commandHintsView() string {
 	return b.String()
 }
 
-func startTask(ch chan tea.Msg, sess *session.Session, task string, history []llm.Message) tea.Cmd {
+// startTask dispatches a full agent task in a goroutine. It accepts the TUI's
+// live cfg so that provider/model changes via /provider take effect immediately.
+func startTask(ch chan tea.Msg, sess *session.Session, cfg config.Config, task string, history []llm.Message) tea.Cmd {
 	return func() tea.Msg {
 		go func() {
 			askUser := func(question string) (string, error) {
@@ -361,8 +490,25 @@ func startTask(ch chan tea.Msg, sess *session.Session, task string, history []ll
 				answer := <-replyCh
 				return answer, nil
 			}
-			out, tools, err := agent.RunTask(sess.Config, sess.Memory, task, history, sess.SyncMemory, askUser)
+			out, tools, err := agent.RunTask(cfg, sess.Memory, task, history, sess.SyncMemory, askUser)
 			ch <- runDoneMsg{task: task, output: out, tools: tools, err: err}
+		}()
+		return nil
+	}
+}
+
+// skillTask dispatches a single skill invocation in a goroutine and sends the
+// result through ch as a runDoneMsg.
+func skillTask(ch chan tea.Msg, sk skills.Skill, task string, timeoutSecs int) tea.Cmd {
+	if timeoutSecs <= 0 {
+		timeoutSecs = 300
+	}
+	return func() tea.Msg {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
+			defer cancel()
+			out, err := sk.Run(ctx, map[string]any{"task": task})
+			ch <- runDoneMsg{task: sk.Name() + ": " + task, output: out, err: err}
 		}()
 		return nil
 	}
